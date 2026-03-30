@@ -1,0 +1,246 @@
+substitutions:
+  board_name: Philips 5400 D1 Mini
+  node_name: philips-5400
+
+esphome:
+  name: ${node_name}
+  friendly_name: ${board_name}
+  comment: Philips EP5400 Series via D1 Mini
+
+esp8266:
+  board: d1_mini
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  fast_connect: on
+  reboot_timeout: 10min
+  ap:
+    ssid: "Philips5400 Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+logger:
+  level: WARN
+  baud_rate: 0   # UART0 fuer Mainboard belegt
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+api:
+  encryption:
+    key: !secret api_key
+
+# ─────────────────────────────────────────────
+# UART
+#
+# Mainboard: RX=GPIO3  TX=GPIO1  (Hardware UART0)
+# Display:   RX=GPIO13 TX=GPIO15 (Software UART)
+#
+# Verkabelung (Man-in-the-Middle):
+#   Kaffeemaschinen-Mainboard TX  → D1 Mini GPIO3  (RX Mainboard)
+#   Kaffeemaschinen-Mainboard RX  → D1 Mini GPIO1  (TX Mainboard)
+#   Kaffeemaschinen-Display   TX  → D1 Mini GPIO13 (RX Display)
+#   Kaffeemaschinen-Display   RX  → D1 Mini GPIO15 (TX Display)
+# ─────────────────────────────────────────────
+uart:
+  - id: uart_mainboard
+    rx_pin: GPIO3
+    tx_pin: GPIO1
+    baud_rate: 115200
+    stop_bits: 1
+    data_bits: 8
+    parity: NONE
+    rx_buffer_size: 512
+
+  - id: uart_display
+    rx_pin: GPIO13
+    tx_pin: GPIO15
+    baud_rate: 115200
+    stop_bits: 1
+    data_bits: 8
+    parity: NONE
+    rx_buffer_size: 512
+
+# ─────────────────────────────────────────────
+# UART Bridge + Protokoll-Parsing
+# Leitet Display↔Mainboard transparent durch
+# und parst dabei den Mainboard-Status
+# ─────────────────────────────────────────────
+interval:
+  - interval: 1ms
+    then:
+      - lambda: |-
+          // ── Display → Mainboard weiterleiten ──────────
+          while (id(uart_display).available()) {
+            uint8_t b;
+            id(uart_display).read_byte(&b);
+            id(uart_mainboard).write_byte(b);
+          }
+
+          // ── Mainboard → Display weiterleiten + parsen ─
+          static uint8_t buf[32];
+          static uint8_t idx = 0;
+
+          while (id(uart_mainboard).available()) {
+            uint8_t b;
+            id(uart_mainboard).read_byte(&b);
+            id(uart_display).write_byte(b);   // transparent durchleiten
+
+            // Frame sammeln: beginnt mit AA AA AA
+            if (idx == 0 && b != 0xAA) continue;
+            if (idx < 32) buf[idx++] = b;
+
+            // Frame-Ende: 0x55 = Terminator laut Protokoll
+            if (b == 0x55 && idx > 4) {
+              // Nur B0-Frames auswerten (Mainboard Status)
+              if (buf[3] == 0xB0 && buf[5] == 0x07) {
+
+                if (buf[6] == 0x06 && buf[9] == 0x00) {
+                  id(idWater).publish_state("Vorhanden");
+                  id(idPallet).publish_state("Eingesetzt");
+                  id(idGrounds).publish_state("Leer");
+                  id(idBeans).publish_state("Vorhanden");
+                  id(idSystem).publish_state("Getränk wählen");
+                  id(idBrewing).publish_state("Nicht aktiv");
+                }
+                else if (buf[6] == 0x08 && buf[7] == 0x05) { id(idBeans).publish_state("Leer"); }
+                else if (buf[6] == 0x0E && buf[9] == 0x40) { id(idWater).publish_state("Fehlt"); }
+                else if (buf[6] == 0x0E && buf[9] == 0x80) { id(idPallet).publish_state("Entnommen"); }
+                else if (buf[6] == 0x0E && buf[9] == 0x00) { id(idGrounds).publish_state("Voll – leeren!"); }
+                else if (buf[6] == 0x0E && buf[9] == 0xC0) {
+                  id(idWater).publish_state("Fehlt");
+                  id(idPallet).publish_state("Entnommen");
+                }
+                else if (buf[6] == 0x0C && buf[7] == 0x01) { id(idBrewing).publish_state("Fertig"); }
+                else if (buf[6] == 0x07 && buf[7] == 0x0E) { id(idBrewing).publish_state("Wasser heizen"); }
+                else if (buf[6] == 0x07 && buf[7] == 0x0D) { id(idBrewing).publish_state("Bohnen mahlen"); }
+                else if (buf[6] == 0x07 && buf[7] == 0x10) { id(idBrewing).publish_state("Milch ausgeben"); }
+                else if (buf[6] == 0x07 && buf[7] == 0x11) { id(idBrewing).publish_state("Kaffee ausgeben"); }
+                else if (buf[6] == 0x07 && buf[7] == 0x13) { id(idBrewing).publish_state("Milch aufschäumen"); }
+                else if (buf[6] == 0x02 && buf[7] == 0x00) { id(idSystem).publish_state("Eingeschaltet"); }
+                else if (buf[6] == 0x05 && buf[7] == 0x00) { id(idSystem).publish_state("Ausgeschaltet"); }
+                else if (buf[6] == 0x08 && buf[7] == 0x0E) { id(idSystem).publish_state("Aufheizen"); }
+                else if (buf[6] == 0x08 && buf[7] == 0x02) { id(idSystem).publish_state("Spülen"); }
+              }
+              idx = 0;  // Frame-Buffer zurücksetzen
+            }
+
+            // Überlauf-Schutz
+            if (idx >= 32) idx = 0;
+          }
+
+# ─────────────────────────────────────────────
+# Sensoren
+# ─────────────────────────────────────────────
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "${board_name} IP"
+
+  - platform: template
+    name: "Wasser"
+    id: idWater
+    icon: mdi:water
+    update_interval: 60s
+
+  - platform: template
+    name: "Auffangschale"
+    id: idPallet
+    icon: mdi:tray
+    update_interval: 60s
+
+  - platform: template
+    name: "Tresterbehälter"
+    id: idGrounds
+    icon: mdi:trash-can-outline
+    update_interval: 60s
+
+  - platform: template
+    name: "Kaffeebohnen"
+    id: idBeans
+    icon: mdi:coffee
+    update_interval: 60s
+
+  - platform: template
+    name: "Zubereitung"
+    id: idBrewing
+    icon: mdi:coffee-maker
+    update_interval: 10s
+
+  - platform: template
+    name: "Systemstatus"
+    id: idSystem
+    icon: mdi:information-outline
+    update_interval: 30s
+
+sensor:
+  - platform: wifi_signal
+    name: "${board_name} RSSI"
+    update_interval: 60s
+
+# ─────────────────────────────────────────────
+# Buttons – Rezepte direkt ans Mainboard
+# ─────────────────────────────────────────────
+button:
+  - platform: restart
+    name: "Neustart"
+    icon: mdi:restart
+
+  - platform: template
+    name: "Ausschalten"
+    icon: mdi:power
+    on_press:
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0xFE, 0x00, 0x00, 0xC8, 0x87, 0x1B, 0x40, 0x55]
+
+  - platform: template
+    name: "Kaffee 150ml"
+    icon: mdi:coffee
+    on_press:
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x93, 0x05, 0x01, 0x01, 0x6A, 0x52, 0x66, 0xE6, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x90, 0x06, 0x0A, 0x00, 0x02, 0x00, 0x02, 0x02, 0x00, 0x96, 0x00, 0x00, 0x00, 0xFC, 0x28, 0xA1, 0x4C, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x91, 0x07, 0x01, 0x03, 0xA3, 0x2F, 0xE5, 0xA1, 0x55]
+
+  - platform: template
+    name: "Cappuccino Max 60/150ml"
+    icon: mdi:coffee
+    on_press:
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x93, 0x05, 0x01, 0x01, 0x6A, 0x52, 0x66, 0xE6, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x90, 0x06, 0x0A, 0x03, 0x02, 0x00, 0x02, 0x03, 0x02, 0x3C, 0x00, 0x96, 0x00, 0xCC, 0xF1, 0x67, 0x25, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x91, 0x07, 0x01, 0x03, 0xA3, 0x2F, 0xE5, 0xA1, 0x55]
+
+  - platform: template
+    name: "Cappuccino Min 20/100ml"
+    icon: mdi:coffee
+    on_press:
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x93, 0x05, 0x01, 0x01, 0x6A, 0x52, 0x66, 0xE6, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x90, 0x06, 0x0A, 0x03, 0x01, 0x00, 0x02, 0x03, 0x02, 0x14, 0x00, 0x64, 0x00, 0xE7, 0xC9, 0xE6, 0x5F, 0x55]
+      - delay: 200ms
+      - uart.write:
+          id: uart_mainboard
+          data: [0xAA, 0xAA, 0xAA, 0x91, 0x07, 0x01, 0x03, 0xA3, 0x2F, 0xE5, 0xA1, 0x55]
